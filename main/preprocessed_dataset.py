@@ -64,19 +64,23 @@ class PreprocessedHypersimDataset(Dataset):
 
         # Convert to tensors
         # rgb: (H, W, 3) -> (3, H, W)
-        rgb_tensor = torch.from_numpy(rgb).permute(2, 0, 1).contiguous()
+        rgb_tensor = torch.from_numpy(rgb).permute(2, 0, 1).contiguous().clone()
 
         # gt_depth: (H, W) -> (1, H, W)
-        gt_depth_tensor = torch.from_numpy(gt_depth).unsqueeze(0).contiguous()
+        gt_depth_tensor = torch.from_numpy(gt_depth).unsqueeze(0).contiguous().clone()
 
         # gt_mask: (H, W) -> (1, H, W)
-        gt_mask_tensor = torch.from_numpy(gt_mask).unsqueeze(0).contiguous()
+        gt_mask_tensor = torch.from_numpy(gt_mask).unsqueeze(0).contiguous().clone()
 
         # sensor_depth: (H, W) -> (1, H, W) - this is the flood-filled input
-        sensor_depth_tensor = torch.from_numpy(sensor_depth).unsqueeze(0).contiguous()
+        sensor_depth_tensor = torch.from_numpy(sensor_depth).unsqueeze(0).contiguous().clone()
 
         # sensor_mask: (H, W) -> (H, W) - sparse validity mask
-        sensor_mask_tensor = torch.from_numpy(sensor_mask).contiguous()
+        sensor_mask_tensor = torch.from_numpy(sensor_mask).contiguous().clone()
+
+        # Keep metadata tensor-backed as well so default_collate receives
+        # resizable storage instead of converting a NumPy-backed array.
+        crop_perimeter_tensor = torch.as_tensor(crop_perimeter).clone()
 
         # Intrinsics for this stage (precomputed)
         # Stage 1: 144x256, Stage 2: 288x512
@@ -96,6 +100,7 @@ class PreprocessedHypersimDataset(Dataset):
         cy = (H - 1) / 2.0
 
         return {
+            "dataset_index": idx,
             "rgb": rgb_tensor,                    # (3, H, W) [0,1]
             "depth_filled_mm": sensor_depth_tensor,  # (1, H, W) mm - flood-filled sensor depth
             "valid_mask": sensor_mask_tensor,     # (H, W) bool - sparse real measurements
@@ -105,7 +110,7 @@ class PreprocessedHypersimDataset(Dataset):
             "fy": fy,
             "cx": cx,
             "cy": cy,
-            "crop_perimeter": crop_perimeter,     # [y, x, h, w]
+            "crop_perimeter": crop_perimeter_tensor,  # [y, x, h, w]
             "sensor_option": sensor_option,
             "scene": meta[0],
             "cam": meta[1],

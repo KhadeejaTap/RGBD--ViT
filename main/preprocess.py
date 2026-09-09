@@ -12,7 +12,7 @@ import numpy as np
 import argparse
 from pathlib import Path
 
-_project_root = Path(__file__).resolve().parent.parent
+_project_root = Path(__file__).resolve().parent.parent # so vitthing
 if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
@@ -90,9 +90,9 @@ HYPERSIM_H, HYPERSIM_W = 768, 1024
 HYPERSIM_FOCAL = 886.81
 
 # Precompute image plane for distance-to-depth conversion
-_imageplane_x = np.linspace((-0.5 * HYPERSIM_W) + 0.5, (0.5 * HYPERSIM_W) - 0.5, HYPERSIM_W).reshape(1, HYPERSIM_W).repeat(HYPERSIM_H, 0).astype(np.float32)[:, :, None]
-_imageplane_y = np.linspace((-0.5 * HYPERSIM_H) + 0.5, (0.5 * HYPERSIM_H) - 0.5, HYPERSIM_H).reshape(HYPERSIM_H, 1).repeat(HYPERSIM_W, 1).astype(np.float32)[:, :, None]
-_imageplane_z = np.full([HYPERSIM_H, HYPERSIM_W, 1], HYPERSIM_FOCAL, np.float32)
+_imageplane_x = np.linspace((-0.5 * HYPERSIM_W) + 0.5, (0.5 * HYPERSIM_W) - 0.5, HYPERSIM_W).reshape(1, HYPERSIM_W).repeat(HYPERSIM_HEIGHT, 0).astype(np.float32)[:, :, None]
+_imageplane_y = np.linspace((-0.5 * HYPERSIM_H) + 0.5, (0.5 * HYPERSIM_H) - 0.5, HYPERSIM_HEIGHT).reshape(HYPERSIM_HEIGHT, 1).repeat(HYPERSIM_WIDTH, 1).astype(np.float32)[:, :, None]
+_imageplane_z = np.full([HYPERSIM_HEIGHT, HYPERSIM_WIDTH, 1], HYPERSIM_FOCAL, np.float32)
 _IMAGEPLANE = np.concatenate([_imageplane_x, _imageplane_y, _imageplane_z], 2)
 _IMAGEPLANE_NORM = np.linalg.norm(_IMAGEPLANE, 2, 2)
 
@@ -134,6 +134,7 @@ def tonemap_rgb(rgb_image):
     """
     Apply Reinhard-style global tonemapping to RGB image.
     Converts linear RGB to tonemapped RGB suitable for display.
+    Returns None if tonemapping cannot be performed properly.
     """
     # Compute brightness using CCIR601 YIQ method (luminance)
     brightness = 0.3 * rgb_image[:, :, 0] + 0.59 * rgb_image[:, :, 1] + 0.11 * rgb_image[:, :, 2]
@@ -148,8 +149,8 @@ def tonemap_rgb(rgb_image):
     valid_mask = brightness > 0
 
     if np.count_nonzero(valid_mask) == 0:
-        # If no valid pixels, return original image
-        scale = 1.0
+        # If no valid pixels, tonemapping cannot be performed
+        return None
     else:
         brightness_valid = brightness[valid_mask]
 
@@ -158,7 +159,8 @@ def tonemap_rgb(rgb_image):
         brightness_nth_percentile_current = np.percentile(brightness_valid, percentile)
 
         if brightness_nth_percentile_current < eps:
-            scale = 0.0
+            # If brightness is too low, tonemapping cannot be performed properly
+            return None
         else:
             # Reinhard-style tonemapping with gamma correction
             scale = np.power(brightness_nth_percentile_desired, inv_gamma) / brightness_nth_percentile_current
@@ -169,8 +171,13 @@ def tonemap_rgb(rgb_image):
     return rgb_tonemapped
 
 
-def process_and_save(samples, split, out_root, stage, rng, total_samples=None, start_index=0, simple=False):
-    """Process all samples and save to disk in flat directory structure."""
+def process_and_save(samples, split, out_root, stage, rng, total_samples=None, start_index=0, simple=False, start_frame=0):
+    """Process all samples and save to disk in flat directory structure.
+
+    Filenames use a global frame count starting at start_frame, so that across
+    multiple stages the files are numbered sequentially (0, 1, 2, …) without
+    resetting per stage.
+    """
     stage_start_time = time.time()
     stage_cfg = STAGE_CONFIGS[stage]
     target_h, target_w = stage_cfg["rgb"]
@@ -179,10 +186,14 @@ def process_and_save(samples, split, out_root, stage, rng, total_samples=None, s
 
     out_dir = out_root
     out_dir.mkdir(parents=True, exist_ok=True)
+    skipped = 0
 
     print(f"  Processing {len(samples)} samples for {split}...")
     print(f"    GT: {target_h}x{target_w}, random sensor option from {sensor_option_names}")
     for idx, sample in enumerate(samples):
+        # Global frame number (does not reset per stage)
+        global_frame = start_frame + idx
+
         # Print progress every 50 samples
         if idx % 50 == 0:
             elapsed = time.time() - stage_start_time
@@ -208,21 +219,40 @@ def process_and_save(samples, split, out_root, stage, rng, total_samples=None, s
         y0, y1 = miny + dy, maxy + dy
 
         loaded = load_sample(sample["color_path"], sample["depth_path"])
+
+        # Validate that we have color and depth keys
+        if not loaded["color_keys"] or not loaded["depth_keys"]:
+            print(f"ERROR: Missing color_keys or depth_keys for scene={sample['scene']}, cam={sample['cam']}, frame={sample['frame']}. Skipping sample.")
+            skipped += 1
+            continue
+
         color_key = loaded["color_keys"][0]
         depth_key = loaded["depth_keys"][0]
 
         # Load RGB (linear scene radiance)
+        if color_key not in loaded["color_data"]:
+            print(f"ERROR: Missing color_key '{color_key}' in color_data for scene={sample['scene']}, cam={sample['cam']}, frame={sample['frame']}. Skipping sample.")
+            skipped += 1
+            continue
         rgb = loaded["color_data"][color_key].astype(np.float32)
 
         # Apply tonemapping first (convert linear RGB to display-appropriate RGB)
-        rgb = tonemap_rgb(rgb)
+        rgb_tonemapped = tonemap_rgb(rgb)
+        if rgb_tonemapped is None:
+            print(f"ERROR: Tonemapping failed for scene={sample['scene']}, cam={sample['cam']}, frame={sample['frame']}. Skipping sample.")
+            skipped += 1
+            continue
+        rgb = rgb_tonemapped
 
         # Get euclidean distance and convert to z-depth BEFORE downsampling
         euclidean_distance = loaded["euclidean_distance"]
         if euclidean_distance is not None:
             gt_depth = distance_to_depth(euclidean_distance.astype(np.float32))  # meters
         else:
-            gt_depth = loaded["depth_data"][depth_key].astype(np.float32)  # meters
+            # Euclidean distance is missing - this indicates corrupted or unexpected data
+            print(f"ERROR: Missing euclidean_distance for scene={sample['scene']}, cam={sample['cam']}, frame={sample['frame']}. Skipping sample.")
+            skipped += 1
+            continue
 
         # Downsample and crop
         rgb_ds = downsample_and_crop(rgb, scale, crop_top, crop_left, crop_h, crop_w, cv2.INTER_AREA)
@@ -234,8 +264,10 @@ def process_and_save(samples, split, out_root, stage, rng, total_samples=None, s
         if rgb_max > rgb_min:
             rgb_ds = (rgb_ds - rgb_min) / (rgb_max - rgb_min)
         else:
-            # Handle flat images
-            rgb_ds = np.zeros_like(rgb_ds)
+            # Handle flat images - cannot normalize properly
+            print(f"ERROR: Flat RGB image for scene={sample['scene']}, cam={sample['cam']}, frame={sample['frame']}. Skipping sample.")
+            skipped += 1
+            continue
 
         # Scale to [0,255] for ImageNet normalization
         rgb_ds = rgb_ds * 255.0
@@ -245,23 +277,14 @@ def process_and_save(samples, split, out_root, stage, rng, total_samples=None, s
         std = np.array([0.229, 0.224, 0.225])
         rgb_ds = (rgb_ds / 255.0 - mean) / std
 
-        # Get euclidean distance and convert to z-depth BEFORE downsampling
-        euclidean_distance = loaded["euclidean_distance"]
-        if euclidean_distance is not None:
-            gt_depth = distance_to_depth(euclidean_distance.astype(np.float32))  # meters
-        else:
-            gt_depth = loaded["depth_data"][depth_key].astype(np.float32)  # meters
-
-        # Downsample and crop
-        rgb_ds = downsample_and_crop(rgb, scale, crop_top, crop_left, crop_h, crop_w, cv2.INTER_AREA)
-        gt_ds = downsample_and_crop(gt_depth, scale, crop_top, crop_left, crop_h, crop_w, cv2.INTER_NEAREST)
-
         # Convert GT depth to mm
         gt_ds_mm = gt_ds * 1000.0
 
-        # Ground truth mask: valid if >= 300mm and <= 20000mm (increased max range)
-        # This naturally handles NaN values (NaN >= 300 is False, NaN <= 20000 is False)
-        gt_mask = (gt_ds_mm >= 300.0) & (gt_ds_mm <= 20000.0)
+        # Ground truth mask: valid if finite and in valid range [0mm, 30000mm]
+        gt_mask = np.isfinite(gt_ds_mm) & (gt_ds_mm >= 0.0) & (gt_ds_mm <= 30000.0)
+
+        # Replace invalid values (NaN, inf, out-of-range) with max depth value to ensure sensor depth gets fixed values
+        gt_ds_mm = np.where(~np.isfinite(gt_ds_mm) | (gt_ds_mm < 0.0) | (gt_ds_mm > 30000.0), 30000.0, gt_ds_mm)
 
         # Sensor depth: crop GT depth using chosen option and random valid shift.
         sensor_depth = gt_ds_mm.copy()
@@ -280,11 +303,11 @@ def process_and_save(samples, split, out_root, stage, rng, total_samples=None, s
         if total_samples is not None:
             # Curriculum learning: start dense, gradually increase sparsity
             progress = (start_index + idx) / total_samples  # 0.0 to 1.0
-            if progress < 1.0/3.0:
-                # First 1/3: 40-50% base density (even denser for very stable start)
+            if progress < 1.0/10.0:
+                # First 10th: 40-50% base density (even denser for very stable start)
                 base_density = rng.uniform(0.40, 0.50)
-            elif progress < 2.0/3.0:
-                # Middle 1/3: 15-20% base density
+            elif progress < 1.0/3.0:
+                # Middle 10 to 30 percent
                 base_density = rng.uniform(0.25, 0.39)
             else:
                 # Final 1/3: 9-12% base density (sparser)
@@ -362,8 +385,9 @@ def process_and_save(samples, split, out_root, stage, rng, total_samples=None, s
                 sensor_depth_padded = sensor_depth_padded[tuple(indices)]
 
         # Save as NPZ (padded sensor depth/mask to match GT resolution)
-        # Include stage in filename to avoid collisions between stage 1 and stage 2 processing
-        fname = f"{sample['scene']}_{sample['cam']}_frame{sample['frame']}_stage{stage}.npz"
+        # Filename uses a global frame count that does not reset per stage,
+        # so files are numbered sequentially (0, 1, 2, …) across all stages.
+        fname = f"frame_{global_frame}.npz"
         np.savez_compressed(
             out_dir / fname,
             rgb=rgb_ds.astype(np.float32),      # (H, W, 3) in [0,1]
@@ -381,15 +405,17 @@ def process_and_save(samples, split, out_root, stage, rng, total_samples=None, s
         )
 
     # Final progress update
+    print(f"  Total samples skipped: {skipped} out of {len(samples)}")
     stage_elapsed = time.time() - stage_start_time
     print(f"    Completed processing {len(samples)} samples for {split} in {stage_elapsed:.2f} seconds ({len(samples)/stage_elapsed:.1f} samples/sec)")
 
 
 def main():
-    scenes_root = _project_root / "../ml-hypersim/evermotion_dataset/scenes"
-    out_root = _project_root / "hypersim_data"
+    scenes_root = _project_root / "../ml-hypersim_test/evermotion_dataset/scenes"
+    out_root = _project_root / "hypersim_test_data"
     seed = 42
     rng = np.random.default_rng(seed)
+
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--simple", action="store_true", help="Use simple sensor simulation (no cropping, shifting, or flood fill)")
@@ -406,24 +432,59 @@ def main():
     print(f"Total frames: {len(all_samples)}")
     print(f"Total scenes: {len(set(s['scene'] for s in all_samples))}")
 
-    # Split samples into first half (stage 1) and second half (stage 2)
-    mid_point = len(all_samples) // 2
-    first_half = all_samples[:mid_point]
-    second_half = all_samples[mid_point:]
+    # Shuffle the loaded data so frames from different scenes are mixed up
+    # before the stage split. This preserves the half/split structure but
+    # randomises the order of scenes within each half.
+    rng.shuffle(all_samples)
 
-    print(f"\n=== Splitting samples ===")
-    print(f"First half ({len(first_half)} samples): processed with stage 1 configuration")
-    print(f"Second half ({len(second_half)} samples): processed with stage 2 configuration")
+    # REPROCESSING MODE: Process frames from index 31700 to 37465 (inclusive) with stage 2
+    START_INDEX = 31700
+    END_INDEX = 37466  # exclusive
+    REPROCESS_COUNT = END_INDEX - START_INDEX  # 5766 frames
+
+    if len(all_samples) <= START_INDEX:
+        print(f"WARNING: Requested to start from index {START_INDEX} but only {len(all_samples)} frames available.")
+        print(f"No frames to process.")
+        samples_to_process = []
+        samples_to_skip_before = all_samples[:]
+        samples_to_skip_after = []
+    elif len(all_samples) < END_INDEX:
+        print(f"WARNING: Requested to process up to index {END_INDEX-1} but only {len(all_samples)} frames available.")
+        print(f"Processing from index {START_INDEX} to {len(all_samples)-1}.")
+        samples_to_process = all_samples[START_INDEX:]
+        samples_to_skip_before = all_samples[:START_INDEX]
+        samples_to_skip_after = []
+        REPROCESS_COUNT = len(samples_to_process)  # Adjust count
+    else:
+        samples_to_process = all_samples[START_INDEX:END_INDEX]  # frames 31700-37465
+        samples_to_skip_before = all_samples[:START_INDEX]       # frames 0-31699
+        samples_to_skip_after = all_samples[END_INDEX:]          # frames 37466+
+        REPROCESS_COUNT = END_INDEX - START_INDEX  # 5766 frames
+
+    print(f"\n=== Reprocessing Configuration ===")
+    print(f"Total frames: {len(all_samples)}")
+    print(f"Frames to skip before (0-{START_INDEX-1}): {len(samples_to_skip_before)} (left untouched)")
+    print(f"Frames to reprocess with stage 2 ({START_INDEX}-{END_INDEX-1}): {len(samples_to_process)}")
+    print(f"Frames to skip after ({END_INDEX}+): {len(samples_to_skip_after)} (left untouched)")
     if args.simple:
         print("Using simple sensor simulation")
 
-    # Process first half with stage 1
-    print(f"\n=== Processing first half with stage 1 ===")
-    process_and_save(first_half, "first_half", out_root, 1, rng, total_samples=len(first_half), start_index=0, simple=args.simple)
+    # Process the specified range with stage 2 (global frame numbering starts at START_INDEX)
+    if len(samples_to_process) > 0:
+        print(f"\n=== Processing frames {START_INDEX} to {START_INDEX+len(samples_to_process)-1} with stage 2 ===")
+        process_and_save(samples_to_process, "reprocess_stage_2_range", out_root, 2, rng,
+                        total_samples=len(samples_to_process), start_index=0,
+                        simple=args.simple, start_frame=START_INDEX)
 
-    # Process second half with stage 2
-    print(f"\n=== Processing second half with stage 2 ===")
-    process_and_save(second_half, "second_half", out_root, 2, rng, total_samples=len(second_half), start_index=len(first_half), simple=args.simple)
+    # Skip processing frames before START_INDEX (leave them untouched)
+    if len(samples_to_skip_before) > 0:
+        print(f"\n=== Skipping {len(samples_to_skip_before)} frames (indices 0-{START_INDEX-1}) ===")
+        print("These frames will be left untouched in their original state.")
+
+    # Skip processing frames after END_INDEX-1 (leave them untouched)
+    if len(samples_to_skip_after) > 0:
+        print(f"\n=== Skipping {len(samples_to_skip_after)} frames (indices {END_INDEX}+) ===")
+        print("These frames will be left untouched in their original state.")
 
     overall_elapsed = time.time() - overall_start_time
     print(f"\nDone! Saved to {out_root}")

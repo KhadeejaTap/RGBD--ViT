@@ -1,9 +1,20 @@
-*npy
-*png
-*npz
-*pt
-*pth
-*pyc
-*md
-outputs/
-*vis/
+# Ignore everything
+*
+
+# Whitelist specific paths
+!/checkpoints/
+!/dinov3-weights/
+!/main/
+!/tests/
+!/main/**
+!/tests/**
+!/*.py
+!/README.md
+!/.gitignore
+
+# Ignore contents of checkpoints and dinov3-weights (even though whitelisted above, we want to ignore what's inside)
+checkpoints/*
+dinov3-weights/*
+
+# Ignore Python cache anywhere
+**/__pycache__/
