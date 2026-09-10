@@ -7,7 +7,7 @@ import matplotlib.cm as cm
 
 # Directories to visualize
 DIRS = [
-    "DfbHSyc5/steady",
+    "",
 ]
 
 for base_dir in DIRS:

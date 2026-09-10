@@ -66,6 +66,8 @@ def parse_args():
     p.add_argument("--overfit-sample-idx", type=int, default=0, help="Index of sample to overfit on (default: 0)")
     p.add_argument("--overfit-iters", type=int, default=500, help="Number of iterations for overfitting (default: 500)")
     p.add_argument("--print-every", type=int, default=50, help="Print overfit metrics every N iterations (default: 50)")
+    p.add_argument("--overfit-save-every", type=int, default=0,
+                   help="Save overfit predictions every N iterations (0 = ten times per run)")
     # Checkpointing
     p.add_argument("--out-dir", type=str, default=out_dir, help="Output directory (default: outputs)")
     p.add_argument("--save-weights", action="store_true", default=True, help="Save model weights")
@@ -594,7 +596,11 @@ def main():
         overfit_pred_dir = Path(args.out_dir) / "predictions" / "overfit"
         overfit_pred_dir.mkdir(parents=True, exist_ok=True)
         np.save(overfit_pred_dir / "gt_depth_mm.npy", prepared_sample["gt_depth"][0].detach().cpu().numpy())
-        save_every = max(1, args.overfit_iters // 10)
+        save_every = (
+            args.overfit_save_every
+            if args.overfit_save_every > 0
+            else max(1, args.overfit_iters // 10)
+        )
 
         # Training loop
         for it in range(1, args.overfit_iters + 1):
@@ -703,6 +709,15 @@ def main():
         resume_step = int(ckpt.get("train_step", 0))
         print(f"Resumed from {resume_path} at global_iter={global_iter}, train_step={resume_step}")
 
+    # Keep TensorBoard's x-axis local to this invocation while checkpoint
+    # iteration counters continue from the resumed training position.
+    tensorboard_step_offset = resume_step
+    if args.use_tensorboard and tensorboard_step_offset:
+        print(
+            f"TensorBoard step reset: displaying resumed iterations from 0 "
+            f"(checkpoint step {tensorboard_step_offset})"
+        )
+
     train_loader = torch.utils.data.DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=args.shuffle,
         num_workers=args.num_workers, pin_memory=True, drop_last=True,
@@ -735,6 +750,19 @@ def main():
     ckpt_dir_path = Path(args.checkpoints_dir)
     if args.save_weights:
         ckpt_dir_path.mkdir(parents=True, exist_ok=True)
+    ckpt_interval = (
+        max(1, int(total_iters * args.save_checkpoint_fraction))
+        if args.save_checkpoint_fraction > 0
+        else None
+    )
+    print(f"Checkpoint directory: {ckpt_dir_path.resolve()}")
+    if ckpt_interval is None:
+        print("Periodic checkpointing disabled")
+    else:
+        print(
+            f"Periodic checkpoints every {ckpt_interval} iterations "
+            f"(fraction={args.save_checkpoint_fraction})"
+        )
 
     # Initialize best validation metric tracking
     best_val_delta1 = -1.0  # delta1 is between 0 and 1, so -1 is worse than any possible value
@@ -991,15 +1019,16 @@ def main():
                 with torch.no_grad():
                     metrics = compute_batch_metrics(depth_pred, prepared)
                 if args.use_tensorboard and writer is not None:
-                    writer.add_scalar('train/loss', avg_train_loss, global_iter)
-                    writer.add_scalar('train/invalid_loss_count', total_invalid_losses, global_iter)
-                    writer.add_scalar('train/invalid_loss_rate', total_invalid_losses / max(global_iter, 1), global_iter)
+                    tensorboard_step = global_iter - tensorboard_step_offset
+                    writer.add_scalar('train/loss', avg_train_loss, tensorboard_step)
+                    writer.add_scalar('train/invalid_loss_count', total_invalid_losses, tensorboard_step)
+                    writer.add_scalar('train/invalid_loss_rate', total_invalid_losses / max(global_iter, 1), tensorboard_step)
                     if metrics:
                         for key, value in metrics.items():
                             if key in ['mae', 'rmse']:
                                 value = value * 1000.0
                                 value = round(value, 1)
-                            writer.add_scalar(f'train/{key}', value, global_iter)
+                            writer.add_scalar(f'train/{key}', value, tensorboard_step)
                 else:
                     # Convert mae and rmse from meters to millimeters and round to 1 decimal place for CSV logging
                     metrics_mm = metrics.copy()
@@ -1008,7 +1037,6 @@ def main():
                     log_to_csv(csv_path, global_iter, "train", avg_train_loss, metrics_mm)
 
             # Save periodic checkpoint if fraction is set (independent of validation)
-            ckpt_interval = max(1, int(total_iters * args.save_checkpoint_fraction)) if args.save_checkpoint_fraction > 0 else None
             if ckpt_interval is not None and global_iter % ckpt_interval == 0:
                 ckpt_path = ckpt_dir_path / f"ckpt_iter{global_iter}.pt"
                 save_checkpoint(
@@ -1035,13 +1063,14 @@ def main():
 
                 # Log validation metrics to CSV or TensorBoard (convert mae and rmse to millimeters and round to 1 decimal place)
                 if args.use_tensorboard and writer is not None:
-                    writer.add_scalar('val/loss', val_loss, global_iter)
+                    tensorboard_step = global_iter - tensorboard_step_offset
+                    writer.add_scalar('val/loss', val_loss, tensorboard_step)
                     if val_metrics:
                         for key, value in val_metrics.items():
                             if key in ['mae', 'rmse']:
                                 value = value * 1000.0
                                 value = round(value, 1)
-                            writer.add_scalar(f'val/{key}', value, global_iter)
+                            writer.add_scalar(f'val/{key}', value, tensorboard_step)
                 else:
                     val_metrics_mm = val_metrics.copy()
                     val_metrics_mm['mae'] = round(val_metrics['mae'] * 1000.0, 1)
