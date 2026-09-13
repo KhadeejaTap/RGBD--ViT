@@ -50,6 +50,11 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=16, help="Batch size (default: 16)")
     p.add_argument("--enc_lr", type=float, default=1e-5, help="Encoder LR (default: 1e-5)")
     p.add_argument("--dec_lr", type=float, default=1e-4, help="Decoder LR (default: 1e-4)")
+    p.add_argument("--layer-decay", type=float, default=1.0,
+                   help="Layer-wise encoder LR decay toward early layers (default: 1.0, disabled)")
+    p.add_argument("--unfreeze-depth-from", type=int, default=-1,
+                   help="Unfreeze depth-branch blocks from this zero-based index through the top block; "
+                        "RGB and lower depth blocks remain frozen (default: disabled)")
     p.add_argument("--grad-clip", type=float, default=0.1, help="Grad clip max norm (default: 0.1)")
     p.add_argument("--weight-decay", type=float, default=1e-2, help="AdamW weight decay (default: 1e-2)")
     p.add_argument("--freeze-encoder", action="store_true", help="Freeze encoder weights, train decoder only")
@@ -135,6 +140,51 @@ def build_model():
     encoder = encoder.to(DEVICE)
     decoder = decoder.to(DEVICE)
     return encoder, decoder
+
+
+def build_optimizer_param_groups(encoder, decoder, enc_lr, dec_lr, layer_decay):
+    """Create encoder groups with lower LR for earlier backbone blocks."""
+    encoder_module = encoder.module if isinstance(encoder, torch.nn.DataParallel) else encoder
+    blocks_per_branch = len(encoder_module.model_rgb.blocks)
+    max_layer = blocks_per_branch - 1
+    grouped_params = {}
+
+    for name, parameter in encoder.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if name.startswith("module."):
+            name = name[len("module."):]
+        layer = 0
+        for prefix in ("model_rgb.blocks.", "model_depth.blocks."):
+            if name.startswith(prefix):
+                block_index = int(name[len(prefix):].split(".", 1)[0])
+                layer = block_index
+                break
+        else:
+            # Stem/embedding parameters use the earliest LR; final norms use
+            # the latest LR because they directly feed the decoder features.
+            if name.startswith(("model_rgb.norm.", "model_depth.norm.")):
+                layer = max_layer
+
+        group_key = layer
+        grouped_params.setdefault(group_key, []).append(parameter)
+
+    param_groups = []
+    for layer in sorted(grouped_params):
+        lr = enc_lr * (layer_decay ** (max_layer - layer))
+        param_groups.append({
+            "params": grouped_params[layer],
+            "lr": lr,
+            "initial_lr": lr,
+        })
+        print(f"Encoder layer {layer}: {len(grouped_params[layer])} tensors, lr={lr:.3e}")
+
+    param_groups.append({
+        "params": [p for p in decoder.parameters() if p.requires_grad],
+        "lr": dec_lr,
+        "initial_lr": dec_lr,
+    })
+    return param_groups
 
 
 def compute_metrics(depth_pred, gt_depth, gt_mask):
@@ -523,17 +573,44 @@ def main():
     if hasattr(encoder_to_check.model_depth, 'cls_token'):
         encoder_to_check.model_depth.cls_token.register_hook(_clip_cls_token)
 
+    if args.freeze_encoder and args.unfreeze_depth_from >= 0:
+        raise ValueError(
+            "--freeze-encoder cannot be combined with --unfreeze-depth-from"
+        )
     if args.freeze_encoder:
         print("Freezing encoder weights.")
         for p in encoder.parameters():
             p.requires_grad = False
+    elif args.unfreeze_depth_from >= 0:
+        encoder_module = encoder.module if isinstance(encoder, torch.nn.DataParallel) else encoder
+        depth_blocks = encoder_module.model_depth.blocks
+        if args.unfreeze_depth_from >= len(depth_blocks):
+            raise ValueError(
+                f"--unfreeze-depth-from must be less than the number of depth blocks "
+                f"({len(depth_blocks)})"
+            )
+        for p in encoder.parameters():
+            p.requires_grad = False
+        for block in depth_blocks[args.unfreeze_depth_from:]:
+            for p in block.parameters():
+                p.requires_grad = True
+        for p in encoder_module.model_depth.norm.parameters():
+            p.requires_grad = True
+        print(
+            f"Unfreezing depth blocks {args.unfreeze_depth_from}-"
+            f"{len(depth_blocks) - 1} and depth final norm; "
+            "RGB and lower depth blocks remain frozen."
+        )
 
     # Create optimizer & scheduler once
-    trainable_enc = [p for p in encoder.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW([
-        {"params": trainable_enc, "lr": args.enc_lr},
-        {"params": decoder.parameters(), "lr": args.dec_lr},
-    ], weight_decay=args.weight_decay)
+    if args.layer_decay <= 0 or args.layer_decay > 1:
+        raise ValueError("--layer-decay must be greater than 0 and no greater than 1")
+    optimizer = torch.optim.AdamW(
+        build_optimizer_param_groups(
+            encoder, decoder, args.enc_lr, args.dec_lr, args.layer_decay
+        ),
+        weight_decay=args.weight_decay,
+    )
 
     warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
         optimizer, start_factor=0.01, end_factor=1.0, total_iters=args.warmup_iters
@@ -568,9 +645,6 @@ def main():
         # Create single-sample datasets
         overfit_train_ds = torch.utils.data.Subset(ds, [sample_idx])
         overfit_val_ds = torch.utils.data.Subset(ds, [sample_idx])  # Use same sample for validation
-
-        optimizer.param_groups[0]['lr'] = args.enc_lr  # Encoder LR
-        optimizer.param_groups[1]['lr'] = args.dec_lr  # Decoder LR
 
         # Run overfitting on a single frame
         print("Starting overfitting...")
@@ -703,8 +777,26 @@ def main():
 
         encoder.load_state_dict(encoder_state)
         decoder.load_state_dict(decoder_state)
-        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        saved_optimizer = ckpt["optimizer_state_dict"]
+        current_optimizer_layout = [
+            len(group["params"]) for group in optimizer.param_groups
+        ]
+        saved_optimizer_layout = [
+            len(group["params"]) for group in saved_optimizer["param_groups"]
+        ]
+        if args.unfreeze_depth_from >= 0:
+            print(
+                "Selective depth unfreezing enabled: loading model weights only; "
+                "starting a fresh optimizer and scheduler."
+            )
+        elif saved_optimizer_layout == current_optimizer_layout:
+            optimizer.load_state_dict(saved_optimizer)
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        else:
+            print(
+                "WARNING: Checkpoint optimizer parameter groups do not match "
+                "the current setup; keeping fresh optimizer and scheduler."
+            )
         global_iter = int(ckpt.get("global_iter", 0))
         resume_step = int(ckpt.get("train_step", 0))
         print(f"Resumed from {resume_path} at global_iter={global_iter}, train_step={resume_step}")
