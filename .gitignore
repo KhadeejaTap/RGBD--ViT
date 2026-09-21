@@ -9,6 +9,9 @@ outputs/
 slurm-*.out
 logs/
 .claude/
+.claude/worktrees/
+worktrees/
+.worktrees/
 **/__pycache__/
 checkpoints/*
 dinov3-weights/*
