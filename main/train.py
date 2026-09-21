@@ -77,13 +77,22 @@ def parse_args():
     p.add_argument("--print-every", type=int, default=50, help="Print overfit metrics every N iterations (default: 50)")
     p.add_argument("--overfit-save-every", type=int, default=0,
                    help="Save overfit predictions every N iterations (0 = ten times per run)")
-    # Checkpointing
+    # Multi-Dataset & Checkpointing
+    p.add_argument("--dataset-name", type=str, default="hypersim",
+                   help="Name/identifier of active dataset (e.g. hypersim, nyu_v2, scannet). Default: hypersim")
+    p.add_argument("--checkpoints-base-dir", type=str, default="checkpoints",
+                   help="Root checkpoints directory. Checkpoints save to <checkpoints-base-dir>/<dataset-name> (default: checkpoints)")
+    p.add_argument("--checkpoints-dir", type=str, default="",
+                   help="Explicit directory to save/load checkpoints. If omitted, defaults to <checkpoints-base-dir>/<dataset-name>")
+    p.add_argument("--reset-dataset-progress", action="store_true",
+                   help="Force reset of dataset progress to sample 1 / epoch 0 even if resuming a checkpoint with the same dataset name")
+    p.add_argument("--keep-optimizer", action="store_true",
+                   help="Preserve optimizer momentum buffers and learning rate when switching to a different dataset (default: fresh optimizer on switch)")
     p.add_argument("--out-dir", type=str, default=out_dir, help="Output directory (default: outputs)")
     p.add_argument("--save-weights", action="store_true", default=True, help="Save model weights")
     p.add_argument("--no-save-weights", dest="save_weights", action="store_false", help="Disable weight saving")
     p.add_argument("--save-checkpoint-fraction", type=float, default=0.0, help="Save a checkpoint every N fractions of total iters (0 = disabled, 1.0 = after every iteration, e.g. 0.1 = every 10%% of total iters)")
     p.add_argument("--val-every-fraction", type=float, default=0.1, help="Run val pass every fraction of iters (default: 0.1)")
-    p.add_argument("--checkpoints-dir", type=str, default="checkpoints", help="Directory to search for auto-resume checkpoints (default: checkpoints)")
     # Resume
     p.add_argument("--resume", type=str, default="", help="Path to checkpoint .pt to resume from")
     # Misc
@@ -382,19 +391,29 @@ def forward_and_loss(encoder, decoder, prepared_batch, args):
         parts["lg"] = 0.0
     return loss, parts, depth_pred, mask_logit
 
-#allows me to continue training
-def save_checkpoint(path, *, train_step, global_iter, encoder, decoder, optimizer, scheduler, train_loss=None, val_loss=None, val_absrel=None, val_delta1=None, val_delta_1025=None):
+# allows continuing training and cross-dataset tracking
+def save_checkpoint(path, *, train_step, global_iter, encoder, decoder, optimizer, scheduler,
+                    dataset_name=None, dataset_step=None, dataset_epoch=None, dataset_history=None,
+                    train_loss=None, val_loss=None, val_absrel=None, val_delta1=None, val_delta_1025=None):
     # Handle DataParallel models by accessing the underlying module
     encoder_state = encoder.module.state_dict() if isinstance(encoder, torch.nn.DataParallel) else encoder.state_dict()
     decoder_state = decoder.module.state_dict() if isinstance(decoder, torch.nn.DataParallel) else decoder.state_dict()
 
+    effective_dataset_name = dataset_name if dataset_name is not None else "hypersim"
+    effective_dataset_step = dataset_step if dataset_step is not None else train_step
+    effective_dataset_epoch = dataset_epoch if dataset_epoch is not None else 0.0
+
     payload = {
         "train_step": train_step,
         "global_iter": global_iter,
+        "dataset_name": effective_dataset_name,
+        "dataset_step": effective_dataset_step,
+        "dataset_epoch": effective_dataset_epoch,
+        "dataset_history": dataset_history if dataset_history is not None else {},
         "encoder_state_dict": encoder_state,
         "decoder_state_dict": decoder_state,
-        "optimizer_state_dict": optimizer.state_dict(),
-        "scheduler_state_dict": scheduler.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else None,
+        "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
     }
     if train_loss is not None:
         payload["train_loss"] = train_loss
@@ -543,17 +562,23 @@ def main():
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     print(f"Device: {DEVICE}")
-    ds = PreprocessedHypersimDataset(data_dir=args.data_dir)
-    print(f"Found {len(ds)} frames")
+
+    # Resolve checkpoints directory for active dataset
+    if not args.checkpoints_dir:
+        args.checkpoints_dir = str(Path(args.checkpoints_base_dir) / args.dataset_name)
+    ckpt_dir_path = Path(args.checkpoints_dir)
+
+    ds = PreprocessedHypersimDataset(data_dir=args.data_dir, dataset_name=args.dataset_name)
+    print(f"Found {len(ds)} samples in {args.dataset_name}")
 
     # Setup logging (CSV or TensorBoard)
     if args.use_tensorboard:
         if SummaryWriter is None:
             raise ImportError("TensorBoard is not installed. Please install tensorboard or disable --use-tensorboard.")
-        tb_log_dir = Path(args.out_dir) / "tb_logs"
+        tb_log_dir = Path(args.out_dir) / "tb_logs" / args.dataset_name
         tb_log_dir.mkdir(parents=True, exist_ok=True)
         writer = SummaryWriter(log_dir=tb_log_dir)
-        print(f"TensorBoard logging enabled. Logs will be saved to: {tb_log_dir}")
+        print(f"TensorBoard logging enabled for [{args.dataset_name}]. Logs will be saved to: {tb_log_dir}")
         csv_path = None  # Disable CSV logging when using TensorBoard
     else:
         # Setup CSV logging
@@ -778,10 +803,19 @@ def main():
         print("OVERFIT COMPLETE!")
         return  # Exit after overfitting
 
+    dataset_history = {}
+    recorded_dataset = "hypersim"
+    is_new_dataset = False
+    dataset_step = 0
+
     if args.resume:
         resume_path = args.resume
     else:
-        resume_path = find_latest_checkpoint(args.checkpoints_dir)
+        # First check active dataset subfolder
+        resume_path = find_latest_checkpoint(ckpt_dir_path)
+        # If not found, check base checkpoints directory (backward compatibility)
+        if resume_path is None and ckpt_dir_path != Path(args.checkpoints_base_dir):
+            resume_path = find_latest_checkpoint(args.checkpoints_base_dir)
         if resume_path is not None:
             print(f"Auto-resume: found checkpoint {resume_path}")
 
@@ -791,14 +825,11 @@ def main():
         encoder_state = ckpt["encoder_state_dict"]
         decoder_state = ckpt["decoder_state_dict"]
 
-        # If loading into DataParallel model but checkpoint doesn't have 'module.' prefix
         if isinstance(encoder, torch.nn.DataParallel) and not any(key.startswith('module.') for key in encoder_state.keys()):
             encoder_state = {'module.' + k: v for k, v in encoder_state.items()}
-        # If loading into non-DataParallel model but checkpoint has 'module.' prefix
         elif not isinstance(encoder, torch.nn.DataParallel) and any(key.startswith('module.') for key in encoder_state.keys()):
             encoder_state = {k.replace('module.', '', 1): v for k, v in encoder_state.items()}
 
-        # Same for decoder
         if isinstance(decoder, torch.nn.DataParallel) and not any(key.startswith('module.') for key in decoder_state.keys()):
             decoder_state = {'module.' + k: v for k, v in decoder_state.items()}
         elif not isinstance(decoder, torch.nn.DataParallel) and any(key.startswith('module.') for key in decoder_state.keys()):
@@ -806,49 +837,76 @@ def main():
 
         encoder.load_state_dict(encoder_state)
         decoder.load_state_dict(decoder_state)
-        saved_optimizer = ckpt["optimizer_state_dict"]
-        current_optimizer_layout = [
-            len(group["params"]) for group in optimizer.param_groups
-        ]
-        saved_optimizer_layout = [
-            len(group["params"]) for group in saved_optimizer["param_groups"]
-        ]
-        if args.unfreeze_depth_from >= 0:
-            print(
-                "Selective depth unfreezing enabled: loading model weights only; "
-                "starting a fresh optimizer and scheduler."
-            )
-        elif saved_optimizer_layout == current_optimizer_layout:
-            optimizer.load_state_dict(saved_optimizer)
-            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+
+        # Inspect checkpoint dataset metadata
+        recorded_dataset = ckpt.get("dataset_name", "hypersim")
+        dataset_history = ckpt.get("dataset_history", {})
+        ckpt_global_iter = int(ckpt.get("global_iter", 0))
+        ckpt_train_step = int(ckpt.get("train_step", 0))
+
+        # Seed dataset_history for backward compatibility if empty
+        if not dataset_history:
+            dataset_history[recorded_dataset] = {
+                "completed_steps": ckpt_train_step,
+                "completed_epochs": float(ckpt.get("dataset_epoch", 1.0)),
+                "global_iter": ckpt_global_iter,
+                "best_val_delta1": float(ckpt.get("val_delta1")) if ckpt.get("val_delta1") is not None else None,
+                "last_active": "prior_checkpoint"
+            }
+
+        is_new_dataset = (args.dataset_name != recorded_dataset) or args.reset_dataset_progress
+
+        if is_new_dataset:
+            dataset_step = 0
+            current_epoch = 0
+            samples_in_current_epoch = 0
+            samples_to_skip = 0
+            global_iter = ckpt_global_iter
+            resume_step = 0
+            print("\n" + "=" * 80)
+            print("  >>> MULTI-DATASET TRANSFER DETECTED <<<")
+            print(f"  Source Checkpoint:        {resume_path}")
+            print(f"  Source Checkpoint Dataset:{recorded_dataset} (global_iter={global_iter})")
+            print(f"  Target Active Dataset:    {args.dataset_name} ({len(train_ds)} train samples)")
+            print(f"  Action: Model weights loaded successfully.")
+            print(f"  Action: Resetting dataset progress -> Sample 1 / Epoch 0 (dataset_step = 0).")
+            print(f"  Action: Cumulative global steps will continue monotonically from {global_iter}.")
+            if not args.keep_optimizer:
+                print("  Action: Initializing fresh optimizer and warmup schedule for new data distribution.")
+            print("=" * 80 + "\n")
         else:
-            print(
-                "WARNING: Checkpoint optimizer parameter groups do not match "
-                "the current setup; keeping fresh optimizer and scheduler."
-            )
-        global_iter = int(ckpt.get("global_iter", 0))
-        resume_step = int(ckpt.get("train_step", 0))
-        print(f"Resumed from {resume_path} at global_iter={global_iter}, train_step={resume_step}")
+            dataset_step = int(ckpt.get("dataset_step", ckpt_train_step))
+            global_iter = ckpt_global_iter
+            resume_step = dataset_step
+            print("\n" + "=" * 80)
+            print("  >>> IN-PROGRESS RESUMPTION (SAME DATASET) <<<")
+            print(f"  Dataset:     {args.dataset_name}")
+            print(f"  Resuming at: dataset_step={dataset_step}, global_iter={global_iter}")
+            print("=" * 80 + "\n")
+
+        # Optimizer loading
+        saved_optimizer = ckpt.get("optimizer_state_dict")
+        if not is_new_dataset and saved_optimizer is not None and not args.stage2 and args.unfreeze_depth_from < 0:
+            current_optimizer_layout = [len(group["params"]) for group in optimizer.param_groups]
+            saved_optimizer_layout = [len(group["params"]) for group in saved_optimizer.get("param_groups", [])]
+            if saved_optimizer_layout == current_optimizer_layout:
+                optimizer.load_state_dict(saved_optimizer)
+                if ckpt.get("scheduler_state_dict") is not None:
+                    scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+                print("Restored optimizer and scheduler state from checkpoint.")
+            else:
+                print("WARNING: Checkpoint optimizer parameter groups do not match current setup; keeping fresh optimizer.")
+        elif is_new_dataset and args.keep_optimizer and saved_optimizer is not None:
+            try:
+                optimizer.load_state_dict(saved_optimizer)
+                print("Carried over optimizer state to new dataset (--keep-optimizer).")
+            except Exception as e:
+                print(f"Could not carry over optimizer ({e}); keeping fresh optimizer.")
+        else:
+            print("Starting fresh optimizer and scheduler for this run.")
 
     start_iter = global_iter
-
-    # Keep TensorBoard's x-axis local to this invocation while checkpoint
-    # iteration counters continue from the resumed training position.
-    # In Stage 2 mode, keep tensorboard_step_offset = 0 so steps log monotonically
-    # from the checkpoint iteration, seamlessly appending to Stage 1 curves.
-    if args.stage2:
-        tensorboard_step_offset = 0
-        print(
-            f"Stage 2 mode: TensorBoard step will continue monotonically from "
-            f"resumed iteration {global_iter} (no step reset)."
-        )
-    else:
-        tensorboard_step_offset = resume_step
-        if args.use_tensorboard and tensorboard_step_offset:
-            print(
-                f"TensorBoard step reset: displaying resumed iterations from 0 "
-                f"(checkpoint step {tensorboard_step_offset})"
-            )
+    tensorboard_step_offset = 0
 
     train_loader = torch.utils.data.DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=args.shuffle,
@@ -864,43 +922,40 @@ def main():
 
     # Handle epoch-based training
     if args.epochs > 0:
-        # Calculate total iterations based on epochs
         samples_per_epoch = batches_per_epoch * args.batch_size
         iterations_per_epoch = batches_per_epoch
-        if args.stage2:
-            # Stage 2: Train for args.epochs starting from current global_iter
+        if is_new_dataset or args.stage2:
             run_iters = args.epochs * iterations_per_epoch
             total_iters = start_iter + run_iters
             print(
-                f"Stage 2 epoch training: {args.epochs} epochs × {iterations_per_epoch} iterations/epoch "
+                f"Epoch training ({args.dataset_name}): {args.epochs} epochs × {iterations_per_epoch} iterations/epoch "
                 f"= {run_iters} run iterations (global_iter {start_iter} → {total_iters})"
             )
         else:
-            total_iters = args.epochs * iterations_per_epoch
-            run_iters = total_iters
-            print(f"Epoch-based training: {args.epochs} epochs × {iterations_per_epoch} iterations/epoch = {total_iters} total iterations")
+            total_dataset_iters = args.epochs * iterations_per_epoch
+            remaining_dataset_iters = max(0, total_dataset_iters - dataset_step)
+            run_iters = remaining_dataset_iters
+            total_iters = start_iter + run_iters
+            print(
+                f"In-progress epoch training ({args.dataset_name}): target {args.epochs} epochs ({total_dataset_iters} iters), "
+                f"already completed {dataset_step} iters → {run_iters} remaining (global_iter {start_iter} → {total_iters})"
+            )
     else:
-        # Use existing iteration-based logic (backward compatibility)
         total_iters = batches_per_epoch
         run_iters = total_iters
-        print(f"Dataset: {len(train_ds)} samples, Batch size: {args.batch_size} → {total_iters} total iterations")
+        print(f"Dataset [{args.dataset_name}]: {len(train_ds)} samples, Batch size: {args.batch_size} → {total_iters} total iterations")
 
     val_every = max(1, int(run_iters * args.val_every_fraction))
-    val_every_percent = (val_every / run_iters) * 100
+    val_every_percent = (val_every / max(1, run_iters)) * 100
     print(f"Validation every {val_every} iterations ({val_every_percent:.1f}% of run)")
 
     # Build scheduled validation milestones
-    if args.stage2:
-        val_milestones = list(range(start_iter + val_every, total_iters + 1, val_every))
-        if not val_milestones or val_milestones[-1] != total_iters:
-            val_milestones.append(total_iters)
-    else:
-        val_milestones = list(range(val_every, total_iters + 1, val_every))
+    val_milestones = list(range(start_iter + val_every, total_iters + 1, val_every))
+    if not val_milestones or val_milestones[-1] != total_iters:
+        val_milestones.append(total_iters)
     print(f"Will validate at iterations: {val_milestones[:10]}{'...' if len(val_milestones) > 10 else ''}")
 
-    ckpt_dir_path = Path(args.checkpoints_dir)
-    if args.save_weights:
-        ckpt_dir_path.mkdir(parents=True, exist_ok=True)
+    ckpt_dir_path.mkdir(parents=True, exist_ok=True)
     ckpt_interval = (
         max(1, int(run_iters * args.save_checkpoint_fraction))
         if args.save_checkpoint_fraction > 0
@@ -911,12 +966,9 @@ def main():
         print("Periodic checkpointing disabled")
         ckpt_milestones = []
     else:
-        if args.stage2:
-            ckpt_milestones = list(range(start_iter + ckpt_interval, total_iters + 1, ckpt_interval))
-            if not ckpt_milestones or ckpt_milestones[-1] != total_iters:
-                ckpt_milestones.append(total_iters)
-        else:
-            ckpt_milestones = list(range(ckpt_interval, total_iters + 1, ckpt_interval))
+        ckpt_milestones = list(range(start_iter + ckpt_interval, total_iters + 1, ckpt_interval))
+        if not ckpt_milestones or ckpt_milestones[-1] != total_iters:
+            ckpt_milestones.append(total_iters)
         print(
             f"Periodic checkpoints every {ckpt_interval} iterations "
             f"(fraction={args.save_checkpoint_fraction} of run, at {ckpt_milestones[:10]})"
@@ -925,14 +977,22 @@ def main():
     # Initialize best validation metric tracking
     best_val_delta1 = -1.0  # delta1 is between 0 and 1, so -1 is worse than any possible value
 
-    all_params = list(encoder.parameters()) + list(decoder.parameters())
+    samples_per_epoch = len(train_ds)
 
     # Handle resumption: determine how many samples to skip
-    if args.stage2:
+    if is_new_dataset or args.stage2:
         samples_to_skip = 0
-        print("Stage 2 mode: starting fresh DataLoader pass (samples_to_skip = 0).")
+        current_epoch = 0
+        samples_in_current_epoch = 0
+        print(f"Dataset [{args.dataset_name}]: starting from sample 1 (samples_to_skip = 0).")
     else:
-        samples_to_skip = resume_step * args.batch_size
+        iterations_per_epoch = max(1, batches_per_epoch)
+        current_epoch = dataset_step // iterations_per_epoch
+        samples_in_current_epoch = (dataset_step % iterations_per_epoch) * args.batch_size
+        samples_to_skip = samples_in_current_epoch
+        print(f"Dataset [{args.dataset_name}]: resuming at epoch {current_epoch}, sample offset {samples_to_skip}.")
+
+    current_dataset_epoch = current_epoch + (samples_in_current_epoch / max(1, samples_per_epoch))
 
     encoder.train()
     decoder.train()
@@ -949,20 +1009,6 @@ def main():
     # Track global sample count across epochs
     global_samples_seen = 0
     step_start_time = None
-
-    # Epoch tracking
-    current_epoch = 0
-    samples_in_current_epoch = 0
-    samples_per_epoch = len(train_ds)
-
-    # Handle resumption for epoch tracking
-    if args.epochs > 0 and resume_step > 0 and not args.stage2:
-        # Calculate which epoch we should be in and position within that epoch
-        iterations_per_epoch = max(1, samples_per_epoch // args.batch_size)
-        current_epoch = resume_step // iterations_per_epoch
-        samples_in_current_epoch = (resume_step % iterations_per_epoch) * args.batch_size
-        # Ensure we don't exceed samples per epoch
-        samples_in_current_epoch = min(samples_in_current_epoch, samples_per_epoch)
 
     train_iter = iter(train_loader)
     first_training_sample_reported = False
@@ -1177,7 +1223,8 @@ def main():
                     raise RuntimeError(f"NaN weights detected in {name} at iter {global_iter+1}")
 
             global_iter += 1
-            resume_step = global_iter
+            dataset_step += 1
+            resume_step = dataset_step
             avg_train_loss = accum_loss_sum / accum_count
             accum_loss_sum = 0.0
             accum_count = 0
@@ -1187,13 +1234,35 @@ def main():
             # Reset step_start_time for the next step
             step_start_time = None
 
+            # Update epoch tracking
+            if args.epochs > 0:
+                samples_in_current_epoch += args.batch_size
+                if samples_in_current_epoch >= samples_per_epoch:
+                    current_epoch += 1
+                    samples_in_current_epoch -= samples_per_epoch
+                    print(f"Completed epoch {current_epoch} for dataset [{args.dataset_name}]")
+            current_dataset_epoch = current_epoch + (samples_in_current_epoch / max(1, samples_per_epoch))
+
+            # Helper to update dataset history ledger
+            dataset_history[args.dataset_name] = {
+                "completed_steps": dataset_step,
+                "completed_epochs": round(current_dataset_epoch, 2),
+                "global_iter": global_iter,
+                "best_val_delta1": round(best_val_delta1, 4) if best_val_delta1 >= 0 else None,
+                "data_dir": str(args.data_dir),
+                "last_updated": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+
             # Log training metrics to CSV or TensorBoard every log_every iterations
             if global_iter % args.log_every == 0:
                 with torch.no_grad():
                     metrics = compute_batch_metrics(depth_pred, prepared)
                 if args.use_tensorboard and writer is not None:
-                    tensorboard_step = global_iter - tensorboard_step_offset
+                    tensorboard_step = global_iter
                     writer.add_scalar('train/loss', avg_train_loss, tensorboard_step)
+                    writer.add_scalar(f'{args.dataset_name}/train_loss', avg_train_loss, tensorboard_step)
+                    writer.add_scalar(f'{args.dataset_name}/dataset_step', dataset_step, tensorboard_step)
+                    writer.add_scalar(f'{args.dataset_name}/epoch', current_dataset_epoch, tensorboard_step)
                     writer.add_scalar('train/invalid_loss_count', total_invalid_losses, tensorboard_step)
                     writer.add_scalar('train/invalid_loss_rate', total_invalid_losses / max(global_iter, 1), tensorboard_step)
                     if metrics:
@@ -1202,6 +1271,7 @@ def main():
                                 value = value * 1000.0
                                 value = round(value, 1)
                             writer.add_scalar(f'train/{key}', value, tensorboard_step)
+                            writer.add_scalar(f'{args.dataset_name}/{key}', value, tensorboard_step)
                 else:
                     # Convert mae and rmse from meters to millimeters and round to 1 decimal place for CSV logging
                     metrics_mm = metrics.copy()
@@ -1214,36 +1284,40 @@ def main():
                 target_ckpt = ckpt_milestones.pop(0)
                 ckpt_path = ckpt_dir_path / f"ckpt_iter{global_iter}.pt"
                 save_checkpoint(
-                    ckpt_path, train_step=global_iter, global_iter=global_iter,
+                    ckpt_path, train_step=dataset_step, global_iter=global_iter,
+                    dataset_name=args.dataset_name, dataset_step=dataset_step,
+                    dataset_epoch=round(current_dataset_epoch, 2), dataset_history=dataset_history,
                     encoder=encoder, decoder=decoder, optimizer=optimizer, scheduler=scheduler,
                     train_loss=avg_train_loss,
                 )
-                print(f"  [periodic checkpoint saved: {ckpt_path}] (iter {global_iter}, milestone {target_ckpt})")
+                print(f"  [periodic checkpoint saved: {ckpt_path}] (dataset_step {dataset_step}, global_iter {global_iter}, milestone {target_ckpt})")
 
             # Progress log every (val_every // 5) steps
             if (global_iter - start_iter) % max(1, val_every // 5) == 0 or global_iter == total_iters:
                 remaining_vals = [m for m in val_milestones if m > global_iter]
                 next_val_str = f"{remaining_vals[0]}" if remaining_vals else "end"
-                print(f"iter {global_iter:5d}/{total_iters}  train_loss={avg_train_loss:.5f}  [next val at iter {next_val_str}]")
+                print(f"iter {global_iter:5d}/{total_iters} (dataset_step {dataset_step})  train_loss={avg_train_loss:.5f}  [next val at iter {next_val_str}]")
 
             # Run validation if milestone reached or at total_iters (milestone-based, robust to skips)
             if (val_milestones and global_iter >= val_milestones[0]) or global_iter == total_iters:
                 target_val = val_milestones.pop(0) if val_milestones else total_iters
-                print(f"--- Running validation at iter {global_iter} (milestone {target_val}) ---")
+                print(f"--- Running validation at iter {global_iter} (milestone {target_val}, dataset {args.dataset_name}) ---")
                 pred_save_dir = Path(args.out_dir) / "predictions" / f"iter{global_iter}"
                 val_loss, val_metrics = run_validation(encoder, decoder, val_ds, args, save_dir=pred_save_dir)
                 print(f"  [val predictions saved: {pred_save_dir}]")
 
                 # Log validation metrics to CSV or TensorBoard (convert mae and rmse to millimeters and round to 1 decimal place)
                 if args.use_tensorboard and writer is not None:
-                    tensorboard_step = global_iter - tensorboard_step_offset
+                    tensorboard_step = global_iter
                     writer.add_scalar('val/loss', val_loss, tensorboard_step)
+                    writer.add_scalar(f'{args.dataset_name}/val_loss', val_loss, tensorboard_step)
                     if val_metrics:
                         for key, value in val_metrics.items():
                             if key in ['mae', 'rmse']:
                                 value = value * 1000.0
                                 value = round(value, 1)
                             writer.add_scalar(f'val/{key}', value, tensorboard_step)
+                            writer.add_scalar(f'{args.dataset_name}/val_{key}', value, tensorboard_step)
                 else:
                     val_metrics_mm = val_metrics.copy()
                     val_metrics_mm['mae'] = round(val_metrics['mae'] * 1000.0, 1)
@@ -1254,8 +1328,11 @@ def main():
                 current_val_delta1 = val_metrics["delta1"]
                 is_best = current_val_delta1 > best_val_delta1
                 if is_best:
-                    print(f"  [NEW BEST] val_delta1 improved from {best_val_delta1:.4f} to {current_val_delta1:.4f}")
+                    print(f"  [NEW BEST] val_delta1 improved from {best_val_delta1:.4f} to {current_val_delta1:.4f} on [{args.dataset_name}]")
                     best_val_delta1 = current_val_delta1
+                    # Update best score in history ledger
+                    dataset_history[args.dataset_name]["best_val_delta1"] = round(best_val_delta1, 4)
+
                     # Remove previous best checkpoint if it exists
                     best_ckpt_path = ckpt_dir_path / "ckpt_best.pt"
                     if best_ckpt_path.exists():
@@ -1264,7 +1341,9 @@ def main():
                     # Save new best checkpoint
                     best_ckpt_path = ckpt_dir_path / "ckpt_best.pt"
                     save_checkpoint(
-                        best_ckpt_path, train_step=global_iter, global_iter=global_iter,
+                        best_ckpt_path, train_step=dataset_step, global_iter=global_iter,
+                        dataset_name=args.dataset_name, dataset_step=dataset_step,
+                        dataset_epoch=round(current_dataset_epoch, 2), dataset_history=dataset_history,
                         encoder=encoder, decoder=decoder, optimizer=optimizer, scheduler=scheduler,
                         train_loss=avg_train_loss, val_loss=val_loss, val_absrel=val_metrics["absrel"],
                         val_delta1=val_metrics["delta1"], val_delta_1025=val_metrics["delta_1025"],
@@ -1276,7 +1355,9 @@ def main():
                 if args.save_weights:
                     ckpt_path = ckpt_dir_path / f"ckpt_iter{global_iter}.pt"
                     save_checkpoint(
-                        ckpt_path, train_step=global_iter, global_iter=global_iter,
+                        ckpt_path, train_step=dataset_step, global_iter=global_iter,
+                        dataset_name=args.dataset_name, dataset_step=dataset_step,
+                        dataset_epoch=round(current_dataset_epoch, 2), dataset_history=dataset_history,
                         encoder=encoder, decoder=decoder, optimizer=optimizer, scheduler=scheduler,
                         train_loss=avg_train_loss, val_loss=val_loss, val_absrel=val_metrics["absrel"],
                         val_delta1=val_metrics["delta1"], val_delta_1025=val_metrics["delta_1025"],
@@ -1285,14 +1366,6 @@ def main():
 
             if global_iter >= total_iters:
                 break
-
-            # Update epoch tracking
-            if args.epochs > 0:
-                samples_in_current_epoch += args.batch_size
-                if samples_in_current_epoch >= samples_per_epoch:
-                    current_epoch += 1
-                    samples_in_current_epoch -= samples_per_epoch
-                    print(f"Completed epoch {current_epoch}")
 
     print("TRAINING COMPLETE!")
     # Close TensorBoard writer if used
@@ -1303,7 +1376,9 @@ def main():
     if args.save_weights:
         final_ckpt_path = ckpt_dir_path / "ckpt_final.pt"
         save_checkpoint(
-            final_ckpt_path, train_step=global_iter, global_iter=global_iter,
+            final_ckpt_path, train_step=dataset_step, global_iter=global_iter,
+            dataset_name=args.dataset_name, dataset_step=dataset_step,
+            dataset_epoch=round(current_dataset_epoch, 2), dataset_history=dataset_history,
             encoder=encoder, decoder=decoder, optimizer=optimizer, scheduler=scheduler,
         )
         print(f"[final checkpoint saved: {final_ckpt_path}]")

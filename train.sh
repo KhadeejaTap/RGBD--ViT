@@ -31,6 +31,7 @@ source /home/ktapkirw/miniconda3/bin/activate && cd /home/ktapkirw/vitthing && c
   --warmup-iters 500 \
   --batch-size 16 \
   --num-workers 6 \
+  --dataset-name hypersim \
   --use-tensorboard \
   --save-weights \
   --checkpoints-dir /home/ktapkirw/vitthing/checkpoints

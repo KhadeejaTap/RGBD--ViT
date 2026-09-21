@@ -28,12 +28,14 @@ class PreprocessedHypersimDataset(Dataset):
     - meta: [scene, cam, frame, stage]
     """
 
-    def __init__(self, data_dir: str):
+    def __init__(self, data_dir: str, dataset_name: str = "hypersim"):
         """
         Args:
             data_dir: Root directory containing preprocessed NPZ files (flat structure)
+            dataset_name: Identifier name for the dataset (e.g., 'hypersim', 'nyu_v2')
         """
         self.data_dir = Path(data_dir)
+        self.dataset_name = dataset_name
 
         # Find all NPZ files directly in the data directory
         self.files = sorted(glob.glob(str(self.data_dir / "*.npz")))
@@ -41,7 +43,7 @@ class PreprocessedHypersimDataset(Dataset):
         if len(self.files) == 0:
             raise FileNotFoundError(f"No NPZ files found in {self.data_dir}")
 
-        print(f"PreprocessedHypersimDataset: samples={len(self.files)}")
+        print(f"PreprocessedDataset [{self.dataset_name}]: {len(self.files)} samples found in {self.data_dir}")
 
     def __len__(self):
         return len(self.files)
@@ -130,3 +132,6 @@ if __name__ == "__main__":
             print(f"  {k}: {v.shape} {v.dtype} [{v.min():.4f}, {v.max():.4f}]")
         else:
             print(f"  {k}: {v}")
+
+# Dataset class alias for multi-dataset support
+PreprocessedDataset = PreprocessedHypersimDataset
