@@ -1,3 +1,4 @@
+
 import torch
 import torch.nn.functional as F
 import math
@@ -11,9 +12,9 @@ from main.alignment import align_points_scale_z_shift, align_points_scale_xyz_sh
 # ============================================================
 
 # Dataset-wide log-spaced depth bins for consistent subsampling
-# Sensor range: 300mm - 20000mm
-DEPTH_MIN = 300.0
-DEPTH_MAX = 20000.0
+# Sensor range: 1mm - 30000mm
+DEPTH_MIN = 1.0
+DEPTH_MAX = 30000.0
 NUM_DEPTH_BINS = 10
 DEPTH_BIN_EDGES = torch.logspace(math.log10(DEPTH_MIN), math.log10(DEPTH_MAX), NUM_DEPTH_BINS + 1)
 
@@ -101,8 +102,8 @@ def depth_weighted_l1_loss(pred_depth: torch.Tensor, gt_depth: torch.Tensor, gt_
 
     # For safe computation, replace invalid depths with 1.0 to avoid NaN/inf
     # This doesn't affect the final loss because invalid positions are masked out later
+    # Actually doesnt do anythign bc we alr filled nans with 12mm
     gt_depth_safe = gt_depth.clone()
-    gt_depth_safe[~valid_mask] = 1.0  # Safe value for depth (avoids division by zero or NaN)
 
     # Inverse depth weighting: 1/d_i (using safe depths)
     weight = 1.0 / gt_depth_safe.clamp_min(eps)  # (B, 1, H, W)
@@ -167,7 +168,6 @@ def global_scale_invariant_loss(pred_depth: torch.Tensor, gt_depth: torch.Tensor
     # For safe backprojection, replace invalid depths with 1.0 to avoid NaN/inf in 3D points
     # This doesn't affect the final loss because invalid positions are masked out later
     gt_depth_safe = gt_depth.clone()
-    gt_depth_safe[~valid_mask] = 1.0  # Safe value for depth (avoids division by zero or NaN)
     gt_points_safe = backproject(gt_depth_safe, fx, fy, cx, cy)  # (B, 3, H, W)
 
     # Reshape to (B, N, 3)
@@ -233,7 +233,7 @@ def local_scale_invariant_loss(pred_depth: torch.Tensor, gt_depth: torch.Tensor,
                                 radius_3d: float = 0.1,
                                 min_points_per_patch: int = 16,
                                 eps: float = 1e-6,
-                                local_loss_downsample: int = 4):
+                                local_loss_downsample: int = 2): # lowered frm 4 to 2, bc res is low rn
     """
     Eq. 6 (local term): Local scale-invariant loss with per-patch scale + xyz-shift.
     Ll = sum_{j in H} sum_{i in S_j} (1/d_i) * ||s_j * p̃_i - p_i||_1
@@ -277,7 +277,8 @@ def local_scale_invariant_loss(pred_depth: torch.Tensor, gt_depth: torch.Tensor,
     # For safe backprojection, replace invalid depths with 1.0 to avoid NaN/inf in 3D points
     # This doesn't affect the final loss because invalid positions are masked out later
     gt_depth_safe = gt_depth.clone()
-    gt_depth_safe[~gt_mask] = 1.0  # Safe value for depth (avoids division by zero or NaN)
+    gt_depth_safe = torch.nan_to_num(gt_depth_safe, nan=1.0, posinf=1.0, neginf=1.0)
+    gt_depth_safe[~gt_mask.bool()] = 1.0  # Safe value for depth (avoids division by zero or NaN)
     gt_points = backproject(gt_depth_safe, fx, fy, cx, cy)      # (B, 3, H, W)
 
     # Valid mask: use provided gt_mask
@@ -324,12 +325,15 @@ def local_scale_invariant_loss(pred_depth: torch.Tensor, gt_depth: torch.Tensor,
 
             # Weight: inverse depth * valid mask (using safe depths for weight computation)
             depth_patch_safe = depth_patch.clone()
-            depth_patch_safe[~mask_patch] = 1.0  # Safe value for depth in patch
-            weight = (1.0 / depth_patch_safe.clamp_min(eps)) * mask_flat.float()  # (B, N_patch)
+            depth_patch_safe = torch.nan_to_num(depth_patch_safe, nan=1.0, posinf=1.0, neginf=1.0)
+            depth_patch_safe[~mask_patch.bool()] = 1.0  # Safe value for depth in patch
+            depth_patch_safe_flat = depth_patch_safe.permute(0, 2, 3, 1).reshape(B, -1)
+            weight = (1.0 / depth_patch_safe_flat.clamp_min(eps)) * mask_flat.float()  # (B, N_patch)
 
             # Skip if too few valid points
             valid_count = mask_flat.sum(dim=-1)
-
+            if (valid_count < min_points_per_patch).all():
+                continue
 
             # Align with scale + xyz-shift per patch
             scale, shift = align_points_scale_xyz_shift(pred_flat, gt_flat, weight)
@@ -388,9 +392,10 @@ def total_loss(pred_depth: torch.Tensor, gt_depth: torch.Tensor,
                fx: float, fy: float, cx: float, cy: float,
                focal: float = None, level: int = 2, radius_2d: float = 0.05,
                radius_3d: float = 0.1, min_points_per_patch: int = 16,
-               eps: float = 1e-6, local_loss_downsample: int = 4):
+               eps: float = 1e-6, local_loss_downsample: int = 4,
+               w_l1: float = 1.0, w_lg: float = 1.0, w_ll: float = 1.0, w_lm: float = 1.0):
     """
-    Eq. 4: L = L1 + Lg + Ll + Lm (equal weighting)
+    Weighted composite loss: L = w_l1*L1 + w_lg*Lg + w_ll*Ll + w_lm*Lm
 
     Args:
         pred_depth: (B, 1, H, W) predicted metric depth
@@ -402,6 +407,7 @@ def total_loss(pred_depth: torch.Tensor, gt_depth: torch.Tensor,
         focal, level, radius_2d, radius_3d, min_points_per_patch: local loss params
         eps: numerical stability
         local_loss_downsample: downsample factor for local loss (default 4)
+        w_l1, w_lg, w_ll, w_lm: weighting coefficients for loss terms
 
     Returns:
         total_loss: scalar tensor
@@ -417,7 +423,7 @@ def total_loss(pred_depth: torch.Tensor, gt_depth: torch.Tensor,
     )
     lm, misc4 = mask_bce_loss(mask_logit, mask_gt)
 
-    total = l1 + lg + ll + lm
+    total = w_l1 * l1 + w_lg * lg + w_ll * ll + w_lm * lm
     misc = {**misc1, **misc2, **misc3, **misc4}
     return total, misc
 

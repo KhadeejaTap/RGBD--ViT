@@ -44,7 +44,7 @@ def main():
     print(DEVICE)
 
     print("\n--- loading sample ---")
-    data_dir = str(Path(__file__).resolve().parent.parent / "hypersim_data")
+    data_dir = str(Path(__file__).resolve().parent.parent / "hypersim_test_data")
     ds = PreprocessedHypersimDataset(data_dir=data_dir)
     if len(ds) == 0:
         raise FileNotFoundError("No NPZ files found in " + data_dir)

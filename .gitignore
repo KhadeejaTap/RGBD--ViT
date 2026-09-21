@@ -7,3 +7,6 @@
 *md
 outputs/
 *vis/
+slurm-*.out
+logs/
+.claude/

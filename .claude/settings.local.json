@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(python3 *)",
-      "Bash(export HYPERSIM_ROOT=/home/khadeeja/ml-hypersim_test/evermotion_dataset/scenes)"
-    ]
-  }
-}

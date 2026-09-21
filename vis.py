@@ -7,7 +7,7 @@ import matplotlib.cm as cm
 
 # Directories to visualize
 DIRS = [
-    "hypersim_data",
+    "overfit",
 ]
 
 for base_dir in DIRS:
@@ -16,7 +16,7 @@ for base_dir in DIRS:
         continue
 
     # Match both naming patterns
-    FILES = sorted(glob.glob(os.path.join(base_dir, "pred*_depth_*.npy")))
+    FILES = sorted(glob.glob(os.path.join(base_dir, "*_depth_*.npy")))
     OUT_DIR = os.path.join(base_dir, "vis")
     os.makedirs(OUT_DIR, exist_ok=True)
 
