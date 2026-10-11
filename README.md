@@ -3,8 +3,8 @@
 
 The goal of this project is to reproduce and extend the method for dense metric depth completion from sparse direct Time-of-Flight (ToF) sensor measurements. Given an RGB image and a sparse depth map from a ToF sensor, the model predicts a dense, metric depth map.
 
-Demo
-<div class="sp-embed-player" data-id="cOQofOnwM16" data-aspect-ratio="1.777778" data-padding-top="56.250000%" style="position:relative;width:100%;padding-top:56.250000%;height:0;"><script src="https://go.screenpal.com/player/appearance/cOQofOnwM16"></script><iframe style="position:absolute;top:0;left:0;width:100%;height:100%;border:0;"  scrolling="no" src="https://go.screenpal.com/player/cOQofOnwM16?ff=1&ahc=1&dcc=1&tl=1&bg=transparent&share=1&download=1&embed=1&cl=1" allow="fullscreen *;" allowfullscreen></iframe></div>
+Demo: https://go.screenpal.com/watch/cOQofOnwM16
+
 ## Features
 
 - **Dual-Branch Encoder**: Separate encoders for RGB and depth modalities, fused via a MaskedJointAttention module that allows depth features to guide RGB feature learning while preventing RGB features from corrupting depth features.
